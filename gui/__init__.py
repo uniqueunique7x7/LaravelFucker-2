@@ -1,0 +1,1 @@
+"""GUI package for the Golden Laravel Scanner application."""
