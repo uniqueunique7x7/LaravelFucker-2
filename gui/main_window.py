@@ -3,6 +3,7 @@
 import itertools
 import queue
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, List, Optional
@@ -30,7 +31,7 @@ from core.persistence import (
     save_session,
     save_settings,
 )
-from core.scanner import ScanResult, Scanner
+from core.scanner import ENV_PATHS, ScanResult, Scanner
 
 
 def tip(widget: Any, text: str) -> None:
@@ -46,6 +47,18 @@ def load_ctk_image(name: str, size: tuple = (22, 22)) -> Optional[ctk.CTkImage]:
         return None
     pil = Image.open(path).resize(size, Image.LANCZOS)
     return ctk.CTkImage(light_image=pil, dark_image=pil)
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format elapsed seconds as a compact h/m/s string."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {sec:02d}s"
+    return f"{sec}s"
 
 
 
@@ -103,13 +116,17 @@ class SplashScreen(ctk.CTkToplevel):
 
 class StatCard(ctk.CTkFrame):
     def __init__(self, master: Any, title: str, value: str = "0",
-                 color: str = GOLD, **kw: Any) -> None:
-        super().__init__(master, fg_color="#1E1E1E", corner_radius=14, **kw)
-        ctk.CTkLabel(self, text=title, font=("Segoe UI", 10),
-                     text_color=TEXT_SOFT).pack(pady=(10, 0))
+                 color: str = GOLD, icon: str = "", **kw: Any) -> None:
+        super().__init__(master, fg_color="#161616", corner_radius=14,
+                         border_width=1, border_color="#272727", **kw)
+        # Colored top accent strip
+        ctk.CTkFrame(self, height=3, fg_color=color, corner_radius=0).pack(fill="x")
+        label_text = f"{icon}  {title}" if icon else title
+        ctk.CTkLabel(self, text=label_text, font=("Segoe UI", 9, "bold"),
+                     text_color="#666666").pack(pady=(8, 0))
         self._val = ctk.CTkLabel(self, text=value,
-                                  font=("Segoe UI", 26, "bold"), text_color=color)
-        self._val.pack(pady=(0, 10))
+                                  font=("Segoe UI", 22, "bold"), text_color=color)
+        self._val.pack(pady=(1, 10))
 
     def set(self, value: Any) -> None:
         self._val.configure(text=str(value))
@@ -143,6 +160,7 @@ class GoldenApp(ctk.CTk):
         self._valid = 0
         self._errors = 0
         self._clean = 0
+        self._scan_start_time: Optional[float] = None
 
         self.title("Golden Scanner  —  Laravel .env Analyzer")
         self.geometry(
@@ -201,43 +219,75 @@ class GoldenApp(ctk.CTk):
         self._build_statusbar()
 
     def _build_nav(self) -> None:
-        nav = ctk.CTkFrame(self, width=220, fg_color=PANEL, corner_radius=0)
+        nav = ctk.CTkFrame(self, width=232, fg_color=PANEL, corner_radius=0)
         nav.grid(row=0, column=0, rowspan=2, sticky="nsew")
         nav.grid_propagate(False)
-        nav.grid_rowconfigure(10, weight=1)
+        nav.grid_rowconfigure(9, weight=1)
         nav.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(nav, text="⚡ Golden", font=("Segoe UI", 20, "bold"),
-                     text_color=GOLD).grid(row=0, column=0, padx=20, pady=(24, 2), sticky="w")
-        ctk.CTkLabel(nav, text="Scanner", font=("Segoe UI", 12),
-                     text_color=TEXT_SOFT).grid(row=1, column=0, padx=20, pady=(0, 16), sticky="w")
+        # ── Logo ──────────────────────────────────────────────────────────────
+        logo_f = ctk.CTkFrame(nav, fg_color="transparent")
+        logo_f.grid(row=0, column=0, padx=14, pady=(20, 4), sticky="ew")
+        ctk.CTkLabel(logo_f, text="⚡", font=("Segoe UI", 26),
+                     text_color=GOLD).pack(side="left")
+        lbl_col = ctk.CTkFrame(logo_f, fg_color="transparent")
+        lbl_col.pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(lbl_col, text="Golden", font=("Segoe UI", 15, "bold"),
+                     text_color=GOLD).pack(anchor="w")
+        ctk.CTkLabel(lbl_col, text="Scanner", font=("Segoe UI", 9),
+                     text_color="#3A3A3A").pack(anchor="w")
 
-        sep = ctk.CTkFrame(nav, height=1, fg_color="#2A2A2A")
-        sep.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+        ctk.CTkFrame(nav, height=1, fg_color="#222222").grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(4, 6))
 
+        # ── Nav items ─────────────────────────────────────────────────────────
         self._nav_btns: Dict[str, ctk.CTkButton] = {}
+        self._nav_accents: Dict[str, ctk.CTkFrame] = {}
         pages = [
             ("🔍  Scanner", "scanner"),
             ("📋  Results", "results"),
             ("📊  Insights", "insights"),
             ("⚙  Settings", "settings"),
         ]
-        for i, (label, key) in enumerate(pages, start=3):
+        for i, (label, key) in enumerate(pages, start=2):
+            row_f = ctk.CTkFrame(nav, fg_color="transparent")
+            row_f.grid(row=i, column=0, padx=8, pady=2, sticky="ew")
+            row_f.grid_columnconfigure(1, weight=1)
+
+            accent = ctk.CTkFrame(row_f, width=4, height=36,
+                                   fg_color="transparent", corner_radius=2)
+            accent.grid(row=0, column=0, padx=(2, 0), sticky="ns")
+            accent.grid_propagate(False)
+            self._nav_accents[key] = accent
+
             btn = ctk.CTkButton(
-                nav, text=label, anchor="w", height=40,
+                row_f, text=label, anchor="w", height=38,
                 command=lambda k=key: self._show_page(k),
-                fg_color="transparent", hover_color="#2D2D2D",
-                text_color=TEXT, font=("Segoe UI", 13), corner_radius=10,
+                fg_color="transparent", hover_color="#1E1E1E",
+                text_color="#555555", font=("Segoe UI", 12), corner_radius=10,
             )
-            btn.grid(row=i, column=0, padx=12, pady=3, sticky="ew")
+            btn.grid(row=0, column=1, sticky="ew")
             self._nav_btns[key] = btn
 
+        ctk.CTkFrame(nav, height=1, fg_color="#222222").grid(
+            row=7, column=0, sticky="ew", padx=14, pady=(6, 6))
+
         ctk.CTkButton(
-            nav, text="📁  Open RESULTS/", height=36, anchor="w",
-            fg_color="#1C1C1C", hover_color="#2D2D2D",
+            nav, text="📁  Open RESULTS/", height=32, anchor="w",
+            fg_color="#141414", hover_color="#1E1E1E",
             command=lambda: webbrowser.open("file:///" + str(Path("RESULTS").resolve())),
-            corner_radius=10, font=("Segoe UI", 11),
-        ).grid(row=11, column=0, padx=12, pady=(0, 20), sticky="ew")
+            corner_radius=10, font=("Segoe UI", 10), text_color="#3A3A3A",
+        ).grid(row=8, column=0, padx=12, pady=(0, 6), sticky="ew")
+
+        # Scan status badge
+        self._nav_scan_badge = ctk.CTkLabel(
+            nav, text="◉  IDLE", font=("Segoe UI", 9, "bold"), text_color="#2E2E2E",
+        )
+        self._nav_scan_badge.grid(row=9, column=0, padx=18, pady=(0, 6), sticky="sw")
+
+        ctk.CTkLabel(nav, text="Laravel .env Analyzer  v2",
+                     font=("Segoe UI", 8), text_color="#212121",
+                     ).grid(row=10, column=0, padx=18, pady=(0, 10), sticky="sw")
 
     def _build_body(self) -> None:
         self._container = ctk.CTkFrame(self, fg_color=BACKGROUND)
@@ -277,9 +327,41 @@ class GoldenApp(ctk.CTk):
 
         # Header
         hdr = ctk.CTkFrame(page, fg_color="transparent")
-        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=24, pady=(20, 0))
+        hdr.grid(row=0, column=0, columnspan=2, sticky="ew", padx=24, pady=(20, 4))
+        hdr.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(hdr, text="Scanner", font=("Segoe UI", 22, "bold"),
-                     text_color=GOLD).pack(side="left")
+                     text_color=GOLD).grid(row=0, column=0, sticky="w")
+
+        # Info badge strip — paths / workers / DNS
+        badge_f = ctk.CTkFrame(hdr, fg_color="transparent")
+        badge_f.grid(row=0, column=1, sticky="e")
+
+        self._badge_paths_f = ctk.CTkFrame(badge_f, fg_color="#162216", corner_radius=8)
+        self._badge_paths_f.pack(side="left", padx=(0, 5))
+        self._badge_paths_lbl = ctk.CTkLabel(
+            self._badge_paths_f,
+            text=f"⛓  {len(self.scanner.env_paths)} paths",
+            font=("Segoe UI", 10), text_color="#4ADE80")
+        self._badge_paths_lbl.pack(padx=10, pady=4)
+
+        self._badge_workers_f = ctk.CTkFrame(badge_f, fg_color="#16162A", corner_radius=8)
+        self._badge_workers_f.pack(side="left", padx=(0, 5))
+        self._badge_workers_lbl = ctk.CTkLabel(
+            self._badge_workers_f,
+            text=f"⚙  {self.settings.get('thread_count', 100)} workers",
+            font=("Segoe UI", 10), text_color="#818CF8")
+        self._badge_workers_lbl.pack(padx=10, pady=4)
+
+        _dns_ok = self.scanner.dns_check
+        self._badge_dns_f = ctk.CTkFrame(
+            badge_f, fg_color="#1A2020" if _dns_ok else "#221616", corner_radius=8)
+        self._badge_dns_f.pack(side="left")
+        self._badge_dns_lbl = ctk.CTkLabel(
+            self._badge_dns_f,
+            text=f"DNS {'✓' if _dns_ok else '✗'}",
+            font=("Segoe UI", 10),
+            text_color="#34D399" if _dns_ok else "#F87171")
+        self._badge_dns_lbl.pack(padx=10, pady=4)
 
         # ── Left panel: targets
         left = ctk.CTkFrame(page, fg_color=PANEL, corner_radius=16)
@@ -307,7 +389,7 @@ class GoldenApp(ctk.CTk):
         # File / clipboard buttons
         br = ctk.CTkFrame(left, fg_color="transparent")
         br.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
-        br.grid_columnconfigure((0, 1, 2), weight=1)
+        br.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         ctk.CTkButton(br, text="📂 Load file", height=36, command=self._load_file,
                       corner_radius=10, fg_color="#252525", hover_color="#303030"
@@ -317,7 +399,10 @@ class GoldenApp(ctk.CTk):
                       ).grid(row=0, column=1, padx=4, sticky="ew")
         ctk.CTkButton(br, text="📋 Paste", height=36, command=self._paste_targets,
                       corner_radius=10, fg_color="#252525", hover_color="#303030"
-                      ).grid(row=0, column=2, padx=(4, 0), sticky="ew")
+                      ).grid(row=0, column=2, padx=4, sticky="ew")
+        ctk.CTkButton(br, text="📁 Paths", height=36, command=self._open_paths_dialog,
+                      corner_radius=10, fg_color="#252525", hover_color="#303030"
+                      ).grid(row=0, column=3, padx=(4, 0), sticky="ew")
 
         # START / PAUSE / STOP + worker slider
         ctrl = ctk.CTkFrame(left, fg_color="transparent")
@@ -367,12 +452,15 @@ class GoldenApp(ctk.CTk):
         pb = ctk.CTkFrame(left, fg_color="transparent")
         pb.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 14))
         pb.grid_columnconfigure(0, weight=1)
-        self._progress = ctk.CTkProgressBar(pb, progress_color=GOLD, corner_radius=6, height=12)
+        self._progress = ctk.CTkProgressBar(pb, progress_color=GOLD, corner_radius=4, height=8)
         self._progress.set(0)
-        self._progress.grid(row=0, column=0, sticky="ew")
+        self._progress.grid(row=0, column=0, columnspan=2, sticky="ew")
         self._prog_label = ctk.CTkLabel(pb, text="0 / 0  (0%)",
                                          font=("Segoe UI", 10), text_color=TEXT_SOFT)
         self._prog_label.grid(row=1, column=0, sticky="w", pady=(3, 0))
+        self._speed_lbl = ctk.CTkLabel(pb, text="",
+                                        font=("Segoe UI", 10), text_color=TEXT_SOFT)
+        self._speed_lbl.grid(row=1, column=1, sticky="e", pady=(3, 0))
 
         # ── Right panel: live feed + stat cards
         right = ctk.CTkFrame(page, fg_color=PANEL, corner_radius=16)
@@ -390,19 +478,26 @@ class GoldenApp(ctk.CTk):
 
         self._live_box = ctk.CTkTextbox(
             right, font=("Consolas", 10), corner_radius=10,
-            fg_color="#111111", text_color="#AAAAAA",
+            fg_color="#0A0A0A", text_color="#2E2E2E",
             scrollbar_button_color=GOLD_SECONDARY, state="disabled",
         )
         self._live_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        # Per-status color tags on the underlying tk.Text widget
+        _tb = self._live_box._textbox
+        _tb.tag_configure("valid", foreground="#4ADE80")
+        _tb.tag_configure("error", foreground="#F87171")
+        _tb.tag_configure("dead",  foreground="#3A3A3A")
+        _tb.tag_configure("empty", foreground=GOLD_SECONDARY)
+        _tb.tag_configure("clean", foreground="#2A2A2A")
 
         sc = ctk.CTkFrame(right, fg_color="transparent")
         sc.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 14))
         sc.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        self._stat_total = StatCard(sc, "TOTAL", "0")
-        self._stat_valid = StatCard(sc, "VALID", "0", color="#4ADE80")
-        self._stat_clean = StatCard(sc, "CLEAN", "0", color=TEXT_SOFT)
-        self._stat_error = StatCard(sc, "ERRORS", "0", color="#F87171")
+        self._stat_total = StatCard(sc, "TOTAL",  "0", color=GOLD,      icon="◈")
+        self._stat_valid = StatCard(sc, "VALID",  "0", color="#4ADE80",  icon="✔")
+        self._stat_clean = StatCard(sc, "CLEAN",  "0", color="#555555",  icon="◯")
+        self._stat_error = StatCard(sc, "ERRORS", "0", color="#F87171",  icon="✖")
 
         self._stat_total.grid(row=0, column=0, padx=4, sticky="ew")
         self._stat_valid.grid(row=0, column=1, padx=4, sticky="ew")
@@ -454,14 +549,16 @@ class GoldenApp(ctk.CTk):
         style.map("Gold.Treeview", background=[("selected", GOLD_SECONDARY)],
                   foreground=[("selected", "#0F0F0F")])
 
-        self._tree = ttk.Treeview(card, columns=("url", "cat", "status"),
+        self._tree = ttk.Treeview(card, columns=("url", "path", "cat", "status"),
                                   show="headings", style="Gold.Treeview")
-        self._tree.heading("url", text="URL")
-        self._tree.heading("cat", text="Category")
+        self._tree.heading("url",    text="URL")
+        self._tree.heading("path",   text="Env Path")
+        self._tree.heading("cat",    text="Category")
         self._tree.heading("status", text="Status")
-        self._tree.column("url", width=500, anchor="w")
-        self._tree.column("cat", width=160, anchor="center")
-        self._tree.column("status", width=100, anchor="center")
+        self._tree.column("url",    width=360, anchor="w")
+        self._tree.column("path",   width=200, anchor="w")
+        self._tree.column("cat",    width=160, anchor="center")
+        self._tree.column("status", width=90,  anchor="center")
         self._tree.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         self._tree.tag_configure("valid", foreground="#4ADE80")
         self._tree.tag_configure("error", foreground="#F87171")
@@ -544,13 +641,19 @@ class GoldenApp(ctk.CTk):
             self._s_autosave.select()
         add_row(2, "Auto-save", self._s_autosave)
 
+        self._s_dns = ctk.CTkCheckBox(card, text="Skip unreachable hosts before HTTP  (faster)",
+                                       fg_color=GOLD, hover_color=GOLD_ALT, text_color=TEXT)
+        if self.scanner.dns_check:
+            self._s_dns.select()
+        add_row(3, "DNS pre-check", self._s_dns)
+
         ctk.CTkButton(card, text="💾  Save Preferences", height=42, corner_radius=12,
                       fg_color=GOLD, hover_color=GOLD_ALT, text_color="#0F0F0F",
                       font=("Segoe UI", 13, "bold"), command=self._save_settings
-                      ).grid(row=3, column=0, columnspan=2, padx=20, pady=(8, 4), sticky="ew")
+                      ).grid(row=4, column=0, columnspan=2, padx=20, pady=(8, 4), sticky="ew")
 
         acts = ctk.CTkFrame(card, fg_color="transparent")
-        acts.grid(row=4, column=0, columnspan=2, padx=20, pady=(4, 20), sticky="ew")
+        acts.grid(row=5, column=0, columnspan=2, padx=20, pady=(4, 20), sticky="ew")
         acts.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(acts, text="↺  Reset State", height=38, corner_radius=12,
                       fg_color="#2B2B2B", hover_color="#3D1010",
@@ -570,9 +673,14 @@ class GoldenApp(ctk.CTk):
             else:
                 frame.grid_remove()
         for k, btn in self._nav_btns.items():
+            is_active = k == key
             btn.configure(
-                fg_color=GOLD if k == key else "transparent",
-                text_color="#0F0F0F" if k == key else TEXT,
+                fg_color="#1A1A1A" if is_active else "transparent",
+                text_color=GOLD if is_active else "#555555",
+                font=("Segoe UI", 12, "bold") if is_active else ("Segoe UI", 12),
+            )
+            self._nav_accents[k].configure(
+                fg_color=GOLD if is_active else "transparent"
             )
 
     # ── Scan controls ────────────────────────
@@ -595,8 +703,10 @@ class GoldenApp(ctk.CTk):
         self._total = total
         self._completed = self._valid = self._errors = self._clean = 0
         self._live_feed_counter = 0
+        self._scan_start_time = time.time()
         self._progress.set(0)
         self._prog_label.configure(text=f"0 / {self._total or '?'}  (0%)")
+        self._speed_lbl.configure(text="")
         self._stat_total.set(self._total or "?")
         self._stat_valid.set(0)
         self._stat_clean.set(0)
@@ -610,6 +720,7 @@ class GoldenApp(ctk.CTk):
         self._btn_start.configure(state="disabled")
         self._btn_pause.configure(state="normal")
         self._btn_stop.configure(state="normal")
+        self._nav_scan_badge.configure(text="◉  SCANNING", text_color="#4ADE80")
         self._set_status(
             f"Scanning {self._total or '?'} targets  ·  {self.scanner.max_workers} workers…"
         )
@@ -642,11 +753,13 @@ class GoldenApp(ctk.CTk):
             self.scanner.resume()
             self._btn_pause.configure(text="⏸  PAUSE", fg_color="#2B2B2B",
                                        text_color=TEXT)
+            self._nav_scan_badge.configure(text="◉  SCANNING", text_color="#4ADE80")
             self._set_status("Scan resumed")
         else:
             self.scanner.pause()
             self._btn_pause.configure(text="▶  RESUME", fg_color=GOLD,
                                        text_color="#0F0F0F")
+            self._nav_scan_badge.configure(text="⏸  PAUSED", text_color=GOLD)
             self._set_status("Scan paused — click RESUME to continue")
 
     def _stop_scan(self) -> None:
@@ -675,7 +788,18 @@ class GoldenApp(ctk.CTk):
     def _on_progress(self, current: int, total: int) -> None:
         pct = current / total if total else 0.0
         self._progress.set(pct)
-        self._prog_label.configure(text=f"{current} / {total}  ({pct*100:.0f}%)")
+        self._prog_label.configure(text=f"{current:,} / {total:,}  ({pct*100:.1f}%)")
+        if self._scan_start_time:
+            elapsed = time.time() - self._scan_start_time
+            speed = current / elapsed if elapsed > 0 else 0.0
+            if speed > 0 and total > current:
+                eta = (total - current) / speed
+                eta_str = f"  ETA {_fmt_time(eta)}"
+            else:
+                eta_str = ""
+            self._speed_lbl.configure(
+                text=f"⚡ {speed:.0f}/s{eta_str}  ⏱ {_fmt_time(elapsed)}"
+            )
 
     def _on_result(self, result: ScanResult) -> None:
         # STOPPED / SKIPPED are not real scan outcomes — ignore them entirely
@@ -709,14 +833,25 @@ class GoldenApp(ctk.CTk):
             lbl = "(all results)" if _rate == 1 else f"(sampled 1/{_rate}  ·  VALID/ERROR/DEAD always shown)"
             self._feed_rate_lbl.configure(text=lbl)
         if result.status in ("VALID", "ERROR", "DEAD") or self._live_feed_counter % _rate == 0:
-            icons = {"VALID": "🟢", "ERROR": "🔴", "CLEAN": "⚪",
-                     "STOPPED": "🟡", "DEAD": "⚫"}
-            icon = icons.get(result.status, "⬜")
+            icons = {"VALID": "✔", "ERROR": "✖", "CLEAN": "·",
+                     "DEAD":  "○", "EMPTY": "◌"}
+            icon = icons.get(result.status, "·")
             cats = ", ".join(result.categories) if result.categories else (result.category or "")
-            cat = f"  → {cats}" if cats else ""
-            line = f"{icon} [{result.status}]  {result.url}{cat}\n"
+            cat = f"  [{cats}]" if cats else ""
+            # Show the actual probed path(s) instead of just the base URL
+            if result.status == "VALID":
+                display_url = result.url  # already contains the matched env path
+            elif result.probed_paths:
+                last_path = result.probed_paths[-1]
+                display_url = f"{result.url}{last_path}  ({len(result.probed_paths)} tried)"
+            else:
+                display_url = result.url
+            tag = {"VALID": "valid", "ERROR": "error", "DEAD": "dead",
+                   "EMPTY": "empty"}.get(result.status, "clean")
+            ts = time.strftime("%H:%M:%S")
+            line = f"{icon} {ts}  {display_url}{cat}\n"
             self._live_box.configure(state="normal")
-            self._live_box.insert(END, line)
+            self._live_box._textbox.insert(END, line, (tag,))
             self._live_box.see(END)
             self._live_box.configure(state="disabled")
 
@@ -741,10 +876,15 @@ class GoldenApp(ctk.CTk):
                                    fg_color="#2B2B2B", text_color=TEXT)
         self._btn_stop.configure(state="disabled")
         self._progress.set(1.0)
+        self._nav_scan_badge.configure(text="◉  IDLE", text_color="#2E2E2E")
+        elapsed = time.time() - self._scan_start_time if self._scan_start_time else 0
+        elapsed_str = f"  ·  {_fmt_time(elapsed)}" if elapsed else ""
+        self._speed_lbl.configure(text=f"⏱ {_fmt_time(elapsed)}" if elapsed else "")
         self._set_status(
-            f"Done — {self._total} scanned  ·  {self._valid} valid  ·  {self._errors} errors"
+            f"Done — {self._total:,} scanned  ·  {self._valid:,} valid  ·  "
+            f"{self._errors:,} errors{elapsed_str}"
         )
-        self._show_toast(f"Scan complete  ·  {self._valid} valid results found")
+        self._show_toast(f"Scan complete  ·  {self._valid:,} valid{elapsed_str}")
         # Results are already persisted line-by-line to RESULTS/results.jsonl
         # No redundant export needed here.
 
@@ -782,6 +922,7 @@ class GoldenApp(ctk.CTk):
         self._btn_pause.configure(state="disabled", text="⏸  PAUSE",
                                    fg_color="#2B2B2B", text_color=TEXT)
         self._btn_stop.configure(state="disabled")
+        self._nav_scan_badge.configure(text="◉  IDLE", text_color="#2E2E2E")
         self._set_status("Reset — counters cleared  ·  stored result files untouched")
         self._show_toast("State reset  ·  stored results preserved")
 
@@ -868,8 +1009,19 @@ class GoldenApp(ctk.CTk):
     def _insert_tree_row(self, result: ScanResult) -> None:
         tag = result.status.lower() if result.status in ("VALID", "ERROR", "CLEAN") else "clean"
         cats = ", ".join(result.categories) if result.categories else (result.category or "—")
-        self._tree.insert("", 0, values=(result.url, cats, result.status),
+        path = self._extract_env_path(result.url)
+        self._tree.insert("", 0, values=(result.url, path, cats, result.status),
                           tags=(tag,))
+
+    @staticmethod
+    def _extract_env_path(url: str) -> str:
+        """Return the path portion of a URL (e.g. /backend/.env), or empty string."""
+        try:
+            idx = url.index("//") + 2
+            host_end = url.find("/", idx)
+            return url[host_end:] if host_end != -1 else ""
+        except ValueError:
+            return ""
 
     def _refresh_results_tree(self) -> None:
         self._tree.delete(*self._tree.get_children())
@@ -880,7 +1032,8 @@ class GoldenApp(ctk.CTk):
                     and q not in item["status"].lower():
                 continue
             tag = item["status"].lower() if item["status"] in ("VALID", "ERROR", "CLEAN") else "clean"
-            self._tree.insert("", END, values=(item["url"], item["category"], item["status"]),
+            path = self._extract_env_path(item["url"])
+            self._tree.insert("", END, values=(item["url"], path, item["category"], item["status"]),
                               tags=(tag,))
 
     def _on_tree_select(self, _: Any) -> None:
@@ -1037,6 +1190,7 @@ class GoldenApp(ctk.CTk):
         self._wlabel.configure(text=f"Workers: {n}")
         self.scanner.max_workers = n
         self.settings["thread_count"] = n
+        self._badge_workers_lbl.configure(text=f"⚙  {n} workers")
 
     def _save_settings(self) -> None:
         try:
@@ -1053,7 +1207,15 @@ class GoldenApp(ctk.CTk):
         save_settings(self.settings)
         self.scanner.max_workers = self.settings["thread_count"]
         self.scanner.timeout = timeout
+        self.scanner.dns_check = bool(self._s_dns.get())
         self._worker_var.set(self.settings["thread_count"])
+        self._badge_workers_lbl.configure(
+            text=f"⚙  {self.settings['thread_count']} workers")
+        _dns_ok = self.scanner.dns_check
+        self._badge_dns_f.configure(fg_color="#1A2020" if _dns_ok else "#221616")
+        self._badge_dns_lbl.configure(
+            text=f"DNS {'✓' if _dns_ok else '✗'}",
+            text_color="#34D399" if _dns_ok else "#F87171")
         self._show_toast("Settings saved")
 
     # ── Keyboard shortcuts ───────────────────
@@ -1080,6 +1242,111 @@ class GoldenApp(ctk.CTk):
         ctk.CTkLabel(toast, text=msg, font=("Segoe UI", 11),
                      text_color=GOLD).pack(expand=True, padx=20, pady=10)
         self.after(duration, toast.destroy)
+
+    # ── Env paths selector ────────────────────
+
+    def _open_paths_dialog(self) -> None:
+        """Open a dialog to select which .env paths to probe per target."""
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Select .env Paths")
+        dialog.resizable(True, True)
+        dialog.configure(fg_color=BACKGROUND)
+        dialog.attributes("-topmost", True)
+        dialog.grab_set()
+        dialog.update_idletasks()
+        dw, dh = 480, 600
+        px = self.winfo_x() + (self.winfo_width() - dw) // 2
+        py = self.winfo_y() + (self.winfo_height() - dh) // 2
+        dialog.geometry(f"{dw}x{dh}+{px}+{py}")
+
+        card = ctk.CTkFrame(dialog, fg_color=PANEL, corner_radius=16)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # Header
+        hdr = ctk.CTkFrame(card, fg_color="transparent")
+        hdr.pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(hdr, text="Env Path Locations",
+                     font=("Segoe UI", 14, "bold"), text_color=GOLD).pack(side="left")
+        # Local variable — NOT stored on self to avoid a stale reference to a
+        # destroyed Tk widget surviving after the dialog is closed.
+        count_lbl = ctk.CTkLabel(hdr, text="",
+                                  font=("Segoe UI", 10), text_color=TEXT_SOFT)
+        count_lbl.pack(side="right")
+
+        ctk.CTkLabel(card, text="Select paths to probe on each target domain.",
+                     font=("Segoe UI", 10), text_color=TEXT_SOFT).pack(padx=16, anchor="w")
+
+        # Select All / Deselect All buttons
+        btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(8, 4))
+
+        checkboxes: List[tuple] = []  # (path, BooleanVar, CTkCheckBox)
+
+        def _update_count() -> None:
+            n = sum(1 for _, v, _ in checkboxes if v.get())
+            count_lbl.configure(text=f"{n} / {len(ENV_PATHS)} selected")
+
+        def _select_all() -> None:
+            for _, v, cb in checkboxes:
+                v.set(True)
+                cb.select()
+            _update_count()
+
+        def _deselect_all() -> None:
+            for _, v, cb in checkboxes:
+                v.set(False)
+                cb.deselect()
+            _update_count()
+
+        ctk.CTkButton(btn_row, text="Select All", width=90, height=28,
+                      corner_radius=8, fg_color="#252525", hover_color="#303030",
+                      font=("Segoe UI", 10), command=_select_all).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_row, text="Deselect All", width=90, height=28,
+                      corner_radius=8, fg_color="#252525", hover_color="#303030",
+                      font=("Segoe UI", 10), command=_deselect_all).pack(side="left")
+
+        # Scrollable checkbox list
+        scroll = ctk.CTkScrollableFrame(card, fg_color="#111111", corner_radius=10)
+        scroll.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+
+        current_paths = set(self.scanner.env_paths)
+        for path in ENV_PATHS:
+            var = ctk.BooleanVar(value=(path in current_paths))
+            cb = ctk.CTkCheckBox(
+                scroll, text=path, variable=var,
+                font=("Consolas", 11), text_color=TEXT,
+                fg_color=GOLD, hover_color=GOLD_ALT,
+                command=_update_count,
+            )
+            cb.pack(anchor="w", padx=8, pady=2)
+            checkboxes.append((path, var, cb))
+
+        _update_count()
+
+        # Apply / Cancel
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.pack(pady=(4, 14))
+
+        def _apply() -> None:
+            selected = [p for p, v, _ in checkboxes if v.get()]
+            if not selected:
+                messagebox.showwarning("No paths", "Select at least one path.", parent=dialog)
+                return
+            self.scanner.env_paths = selected
+            n = len(selected)
+            self._badge_paths_lbl.configure(text=f"⛓  {n} paths")
+            self._set_status(f"Env paths updated — {n} path{'s' if n != 1 else ''} selected")
+            self._show_toast(f"{n} env path{'s' if n != 1 else ''} selected")
+            dialog.destroy()
+
+        ctk.CTkButton(btns, text="Apply", width=100, height=34, corner_radius=10,
+                      fg_color=GOLD, hover_color=GOLD_ALT, text_color="#0F0F0F",
+                      font=("Segoe UI", 12, "bold"), command=_apply
+                      ).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", width=80, height=34, corner_radius=10,
+                      fg_color="#2B2B2B", hover_color="#3A3A3A",
+                      font=("Segoe UI", 12), command=dialog.destroy
+                      ).pack(side="left", padx=6)
 
     def _on_close(self) -> None:
         self.scanner.stop()

